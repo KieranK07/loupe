@@ -1,0 +1,79 @@
+name: Loupe
+options:
+  bundleIdPrefix: com.kierankelly
+  deploymentTarget: { macOS: "26.0" }
+  createIntermediateGroups: true
+  groupSortPosition: top
+
+settings:
+  base:
+    MACOSX_DEPLOYMENT_TARGET: "26.0"
+    SWIFT_VERSION: "6.0"
+    SWIFT_STRICT_CONCURRENCY: complete
+    DEVELOPMENT_TEAM: PX7CJUB7QF
+    # Local development signs ad-hoc. The only identity on this machine is an
+    # "Apple Development" cert, which macOS targets do not accept as a
+    # "Mac Development" identity, and Loupe needs no provisioning profile
+    # (not sandboxed, no profile-gated entitlements).
+    #
+    # Known consequence, and it is risk #7 in docs/ARCHITECTURE.md: TCC keys the
+    # Full Disk Access grant to the code-signing identity, and an ad-hoc
+    # signature changes every build — so FDA must be re-granted after a rebuild.
+    # Release switches to Developer ID once that certificate exists.
+    CODE_SIGN_STYLE: Manual
+    CODE_SIGN_IDENTITY: "-"
+    PROVISIONING_PROFILE_SPECIFIER: ""
+    # Hardened runtime is required for notarization, and notarization is the
+    # whole distribution story: this app needs Full Disk Access, which the App
+    # Store sandbox cannot express.
+    ENABLE_HARDENED_RUNTIME: YES
+    ENABLE_USER_SCRIPT_SANDBOXING: YES
+    DEAD_CODE_STRIPPING: YES
+    GCC_WARN_ABOUT_RETURN_TYPE: YES_ERROR
+    SWIFT_TREAT_WARNINGS_AS_ERRORS: NO
+  configs:
+    Debug:
+      SWIFT_OPTIMIZATION_LEVEL: "-Onone"
+      SWIFT_ACTIVE_COMPILATION_CONDITIONS: DEBUG
+    Release:
+      SWIFT_OPTIMIZATION_LEVEL: "-O"
+      SWIFT_COMPILATION_MODE: wholemodule
+
+packages:
+  LoupeCore: { path: Packages/LoupeCore }
+  LoupeTree: { path: Packages/LoupeTree }
+  LoupeFS:   { path: Packages/LoupeFS }
+  LoupeUI:   { path: Packages/LoupeUI }
+  LoupeReclaim: { path: Packages/LoupeReclaim }
+
+targets:
+  Loupe:
+    type: application
+    platform: macOS
+    sources:
+      - path: App
+    info:
+      path: App/Info.plist
+      properties:
+        CFBundleName: Loupe
+        CFBundleDisplayName: Loupe
+        CFBundleShortVersionString: "0.1.0"
+        CFBundleVersion: "1"
+        LSMinimumSystemVersion: "26.0"
+        LSApplicationCategoryType: public.app-category.utilities
+        NSHumanReadableCopyright: "Loupe runs entirely on this Mac. It has no account, sends no telemetry, and makes no network requests."
+        NSSupportsAutomaticTermination: false
+        NSSupportsSuddenTermination: false
+    entitlements:
+      path: App/Loupe.entitlements
+      properties:
+        # Deliberately NOT sandboxed. Full Disk Access and an App Store sandbox
+        # are mutually exclusive; see docs/ARCHITECTURE.md section 9.
+        com.apple.security.app-sandbox: false
+        # No network entitlement of any kind. Loupe makes no network requests.
+    dependencies:
+      - package: LoupeCore
+      - package: LoupeTree
+      - package: LoupeFS
+      - package: LoupeUI
+      - package: LoupeReclaim

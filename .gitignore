@@ -1,0 +1,28 @@
+# macOS
+.DS_Store
+
+# Xcode / SwiftPM build output
+build/
+DerivedData/
+.build/
+.swiftpm/
+*.xcodeproj
+!project.yml
+*.xcuserdatad
+xcuserdata/
+*.xcuserstate
+*.hmap
+*.dSYM
+*.dSYM.zip
+
+# Signing and secrets — none of this belongs in the repo
+*.pem
+*.key
+*.p12
+*.cer
+*.mobileprovision
+*.keychain
+*.keychain-db
+.env
+.env.*
+.netrc
