@@ -840,6 +840,9 @@ struct TreemapPerformanceTests {
         // visited, so this touches roughly 26k of the 210k nodes.
         #expect(tileCount > 1000)
         #expect(tileCount <= TreemapGeometry.maximumTiles)
-        #expect(best < .milliseconds(100))
+        // The time budget is for optimised code; see BuildConfiguration.swift.
+        if isOptimizedBuild {
+            #expect(best < .milliseconds(100))
+        }
     }
 }

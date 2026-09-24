@@ -595,7 +595,10 @@ struct ProjectionPerformanceTests {
         // The projection descends breadth-first and stops: it touches roughly 26k of
         // the 210k nodes, because everything under a culled wedge is never visited.
         #expect(wedgeCount > 1000)
-        #expect(best < .milliseconds(100))
+        // The time budget is for optimised code; see BuildConfiguration.swift.
+        if isOptimizedBuild {
+            #expect(best < .milliseconds(100))
+        }
     }
 }
 
