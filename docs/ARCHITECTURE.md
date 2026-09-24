@@ -1,6 +1,6 @@
 # Loupe — Architecture
 
-**Status:** design, pre-implementation. **Target:** macOS 26.0 minimum (26 + 27 when 27 ships).
+**Status:** phases 1–3 built (walk, charts, cleaner); phases 4–6 not started. Sections 0–12 are the original design and predate the code in places; sections 13–14 describe what was built. **Target:** macOS 26.0 minimum (26 + 27 when 27 ships).
 **Toolchain:** Swift 6.3, strict concurrency, SwiftUI + AppKit interop. Distribution: Developer ID + notarized + hardened runtime.
 
 Loupe shows you your machine. It does not optimize it. Every number it prints must
@@ -119,10 +119,13 @@ the package graph, so a violation is a compile error rather than a code-review n
 | **LoupeFS** | Volume enumeration, the walker + thread pool, snapshot/purgeable accounting. Fills arenas. | import LoupeUI |
 | **LoupeTree** | The arena, aggregation, projections, sunburst + treemap layout maths. Pure, deterministic, fully unit-testable with zero filesystem access. | import LoupeUI or LoupeFS |
 | **LoupeReclaim** | Cleanup catalog, safety engine + blocklist, dry-run planner, trash executor. | delete anything without a dry-run plan |
-| **LoupeSecurity** | Config posture, permissions, trust/persistence probes. | say "antivirus" or "malware" |
-| **LoupeHelperProtocol** | The `@objc` XPC contract. Shared verbatim by app and daemon. | grow beyond read-only |
+| **LoupeSecurity** *(not built)* | Config posture, permissions, trust/persistence probes. | say "antivirus" or "malware" |
+| **LoupeHelperProtocol** *(not built)* | The `@objc` XPC contract. Shared verbatim by app and daemon. | grow beyond read-only |
 | **LoupeUI** | Every view, the hand-rolled sunburst `Canvas`, design tokens. | touch the filesystem or the arena |
 | **Loupe** | Composition root, onboarding, Full Disk Access gate. | contain business logic |
+
+`LoupeSecurity`, `LoupeHelperProtocol` and the `Helper` daemon are designed (phases 4 and 5)
+but have no code and no directory in the repo yet.
 
 **The load-bearing rule: `LoupeUI` cannot import `LoupeFS`.** The UI has no way to reach a
 file, an arena, or a syscall. It can only render the small immutable projections described
@@ -416,7 +419,7 @@ Mitigation is a stable signing identity across dev builds. See risk #6.
 
 ## 8. A recommendation that was overruled, recorded honestly
 
-I recommended cutting the privileged helper from v1. The audit behind that: the disk walk,
+The design review recommended cutting the privileged helper from v1. The audit behind that: the disk walk,
 deletion, codesign/notarization checks, and FileVault/SIP/Gatekeeper/firewall status all
 work with **Full Disk Access alone**. Root is genuinely needed only for the Background Task
 Manager login-item database and full configuration-profile enumeration — two checks, in
@@ -466,7 +469,7 @@ Loupe/
 │   │   └── OnboardingView.swift
 │   ├── Info.plist
 │   └── Loupe.entitlements
-├── Helper/                         SMAppService privileged daemon (Phase 5)
+├── Helper/                         SMAppService privileged daemon (Phase 5, not built)
 │   ├── main.swift
 │   ├── HelperListener.swift        setConnectionCodeSigningRequirement, no audit-token SPI
 │   └── Helper.entitlements
@@ -491,7 +494,7 @@ Loupe/
     │           ├── ScanEngine.swift       dedicated Thread pool, NOT the cooperative pool
     │           ├── VolumeEnumerator.swift getmntinfo_r_np, MNT_LOCAL
     │           ├── HardlinkSet.swift      64-way sharded (dev, ino)
-    │           └── SnapshotReader.swift   tmutil only — diskutil is banned, see §4
+    │           └── SnapshotReader.swift   fs_snapshot_list(2); diskutil is banned, see §4
     ├── LoupeUI/                    depends ONLY on LoupeCore — no route to a syscall
     │   └── Sources/LoupeUI/
     │       ├── SunburstView.swift         hand-rolled Canvas
@@ -499,7 +502,7 @@ Loupe/
     │       ├── SunburstHitTest.swift      analytic (r, theta) + binary search
     │       └── Palette.swift              stable categorical hue, light/dark
     ├── LoupeReclaim/               Phase 3
-    └── LoupeSecurity/              Phase 4
+    └── LoupeSecurity/              Phase 4, not built
 ```
 
 ---
@@ -521,7 +524,7 @@ Ordered by expected pain. Honest confidence stated, not implied.
 | 9 | **Trash semantics** | `trashItem` fails in real ways: other volumes, files owned by another user, missing `.Trashes`. And trashing frees nothing until the Trash is emptied — which the UI must say plainly rather than claiming reclaimed bytes. | High confidence we handle it; it is fiddly, not deep. |
 | 10 | **Purgeable never matches Finder** | Snapshots and purgeable caches mean the numbers cannot be reconciled exactly. Loupe explains the gap instead of pretending. | High confidence in the approach; guaranteed to generate "why doesn't this match?" questions anyway. |
 
-**Where I am least confident overall:** risk #2. The helper was kept in v1 over my recommendation, and the strongest argument against it has since gotten stronger, not weaker — it may not be able to do the one job it exists for. See §8 and `docs/specs/privileged-helper.md`.
+**Lowest confidence overall:** risk #2. The helper was kept in v1 against the recommendation in §8, and the strongest argument against it has since gotten stronger, not weaker — it may not be able to do the one job it exists for. See §8 and `docs/specs/privileged-helper.md`.
 
 **A hazard specific to this machine:** **SIP is disabled** (`csrutil status: disabled`). `SF_RESTRICTED` flags are still set on `/System`, `/usr` and `/Library/Apple`, but the kernel will not enforce them here. So Loupe's own blocklist is the *only* thing standing between a bug and a destroyed system file on this box, and a passing delete-safety test proves nothing about a normal Mac. Every destructive-path test must be re-run on a SIP-enabled machine before release.
 
@@ -541,3 +544,184 @@ Every phase ends with an app that launches and does something real.
 | **6** | Onboarding polish, accessibility pass, perf hardening, Developer ID signing, notarization, release. | Requires a Developer ID Application certificate, which this machine does not yet have. |
 
 **Deliberately not in v1:** cross-platform, menu bar agent, scheduled or automatic cleaning, accounts, cloud sync, any "system optimizer" claim, and known-vulnerability matching (cut — see §7).
+
+---
+
+Sections 13 and 14 describe the implementation as it stands, and take precedence over the
+design sections above where the two disagree.
+
+## 13. How the walk works, as built
+
+Getting a size out of `FileManager.enumerator` or `fts(3)` costs a `stat` per entry.
+`getattrlistbulk(2)` returns a whole batch of directory entries *with their attributes*
+in one syscall, which is the difference between a walk you wait for and one you watch
+happen. The catch is that the kernel hands back a packed, variable-layout buffer:
+attributes come in ascending bit order, groups are absent per-entry depending on object
+type, and consuming a field the returned-attrs mask says isn't there desynchronises every
+remaining entry in the buffer.
+
+So the decode lives in a small C target, `CLoupeFS`, and Swift never touches the raw
+buffer — it gets a flat `loupe_entry_t` per file. The C side decodes and reports; it takes
+no policy decisions. Two things there are load-bearing:
+
+- `setiopolicy_np(IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES, IOPOL_SCOPE_PROCESS, OFF)`
+  is called once before any walking. Without it, walking a normal home directory
+  downloads the user's entire iCloud Drive — the development machine had 132,390
+  dataless placeholders. This is the single most dangerous line in the app and it is a one-liner.
+- Directories are opened `O_NOFOLLOW`, so a symlink pointing at a directory is never
+  enumerated through. That, plus refusing to push any path that `snprintf` truncated,
+  is what stops the walk from cycling. The C prototype hung on exactly this: a truncated
+  deep Xcode path resolved to one of its own *ancestors*, and the walk ran forever.
+
+`getattrlistbulk` is a blocking syscall, so the walk cannot run on Swift Concurrency's
+cooperative pool — a fixed-width pool has no idea a thread is parked in the kernel, and
+parking eight of them starves everything else in the process, including the UI. The
+walker therefore owns `clamp(activeProcessorCount - 2, 4, 8)` dedicated `Thread`s (two
+cores left free so the compositor stays smooth), each with its own 256 KiB read buffer,
+pulling directory work items off a shared LIFO stack. The stack is seeded breadth-first
+for the first three levels so the inner rings of the chart fill immediately, then goes
+depth-first per worker for locality.
+
+Entries land in two arenas of POD structs — `FileNode` is 32 bytes, `DirNode` is 56 —
+rather than a graph of class nodes, because ARC traffic and allocator pressure for four
+million nodes would cost more than the walk itself. A `NodeRef` is a tagged index: high
+bit picks the arena, low 31 bits the slot. Because `getattrlistbulk` returns a whole
+directory, the walker reads one completely, partitions it into files and subdirectories,
+and appends each group as one contiguous run — so a directory needs only a start index
+and a count per group, with no sibling pointers, and one mutex acquisition per
+*directory* rather than per entry.
+
+Structure is append-only and totals only ever increase, which is what lets a reader walk
+the arena while the writer is still filling it and see a consistent-if-incomplete tree.
+That is the whole reason progressive rendering is safe without copying anything.
+
+### Numbers
+
+Measured on an M-series Mac (4P + 6E), macOS 26, APFS, release builds:
+
+| target | entries | threads | elapsed | entries/sec |
+|---|---:|---:|---:|---:|
+| `$HOME` | 1,965,464 | 1 | 30.38 s | 64,696 |
+| `$HOME` | 1,965,464 | 8 | 6.29 s | 312,588 |
+| `$HOME` | 2,017,155 | 8 | 5.95 s | 339,049 |
+| `/Applications` | 377,919 | 8 | 0.62 s | 611,773 |
+
+Single-threaded misses a 30-second budget, so the parallelism is the feature, not an
+optimisation. The knee is at 6–8 threads; j=12 buys another 0.6 s and costs the UI its
+headroom. The arena held 108 MB at two million entries.
+
+The same walk is where most of the app's design came from. Logical size was 770.0 GiB
+against 251.4 GiB physical — a 3.06x gap, so reporting one number would have been a lie.
+74,701 files were hard-linked, and not de-duplicating them overcounts `Xcode.app` alone
+by 5.6%. Maximum tree depth was 25, which is why keyboard navigation exists. And two
+successive runs disagreed by two entries, which is why the UI always says "as of <time>"
+rather than implying a snapshot.
+
+`ATTR_CMNEXT_PRIVATESIZE` — the bytes a file uniquely owns, and the only way to tell an
+APFS clone from an ordinary file — works, and costs 3.6x in the kernel (`/Applications`
+drops from 905k to 245k entries/sec), so it is off by default and surfaced as a deliberate
+"measure clone-aware sizes (slower)" choice rather than silently spending someone's time.
+
+### Volumes, and why the numbers won't match Finder
+
+Loupe scans `/System/Volumes/Data` directly rather than `/`. Walking from `/` means
+traversing firmlinks back into the Data volume, which double-counts; scanning the Data
+root sidesteps the whole class of bug, and the sealed system volume is presented as one
+honest "sealed, read-only" entry instead. Belt and braces: entries carrying `SF_FIRMLINK`
+are never traversed, and every entry's device id is compared against the scan root's.
+
+Local APFS snapshots — usually the reason free space doesn't add up — come from
+`fs_snapshot_list(2)`, a public syscall. Not `diskutil`: **every** `diskutil` invocation,
+including a read-only `apfs listSnapshots`, goes to `authd` and requests privileged
+rights, which produced real admin password prompts during development. A read-only
+inspection tool must never do that, so there is no `Process` call anywhere in the app.
+
+### The UI cannot reach the filesystem
+
+`LoupeUI` deliberately does not depend on `LoupeFS` or `LoupeTree`, so a violation is a
+compile error rather than a code-review note. It renders small immutable `Sendable`
+projections and has no route to a syscall or an arena. A projection step runs off the main
+actor at about 10 Hz with `.bufferingNewest(1)`, so a slow frame drops stale work instead
+of queueing it. Ring depth is capped and anything under ~0.35° is merged into a synthetic
+aggregate wedge, which holds a layout to 2–4k wedges regardless of tree size — a 4M-entry
+volume and a 40k-entry folder produce layouts of the same order. The charts are hand-rolled
+SwiftUI `Canvas`, and hit testing is analytic: a point becomes `(r, θ)`, `r` picks the ring,
+and a binary search over that ring's wedges finds the target. No `CGPath` containment tests.
+
+## 14. The cleaner, and what it refuses to do
+
+This part deletes user files, so the mechanism matters more than the feature list.
+
+**One primitive.** The only call in `LoupeReclaim` that changes the disk is
+`FileManager.trashItem(at:resultingItemURL:)`. There is no `unlink`, no `removeItem`, no
+shell, no `Process`. A test (`BannedSymbolTests`) greps every source file in the module —
+with comments stripped, so a comment saying "never call unlink" doesn't pass for the real
+thing — asserts none of the alternatives appear, and asserts `trashItem(at:` appears in
+exactly one file. Trashing is recoverable by dragging the item back, and every guard in
+the package is ultimately backstopped by that.
+
+**Nineteen named targets, no pattern matching.** Xcode DerivedData, Homebrew's download
+cache, npm/pnpm/yarn/pip/uv caches, the Docker Desktop disk image, Safari/Chromium/Firefox
+caches, iOS device backups, and so on. Every entry states what breaks and how it comes
+back, in one sentence each, shown verbatim. There is deliberately no rule that means
+"find anything cache-shaped" and no bulk entry for `~/Library/Caches`. Sixteen of the
+nineteen are deletable by Loupe; the other three are listed, sized and explained but hand
+off — the Trash itself is reveal-in-Finder, stale Downloads is review-only, and unusable
+simulator runtimes are delegated to `xcrun simctl`, which is the tool that actually
+removes them.
+
+**A closed-by-default safety engine.** `SafetyEngine.evaluate` returns `.allowed` only
+after a path survives all of:
+
+1. canonicalisation — `realpath` plus APFS firmlink normalisation;
+2. a lexical deny table matched by whole path component;
+3. an identity walk: `lstat` every ancestor and check its `(dev, ino)` against the
+   resolved deny roots, which catches a hardlink whose name says nothing about where its
+   inode lives;
+4. filesystem flags on the candidate and every ancestor — `SF_RESTRICTED`,
+   `UF_DATAVAULT`, `SF_DATALESS`, `SF_FIRMLINK`, `SF_NOUNLINK`, `SF_IMMUTABLE`,
+   `UF_IMMUTABLE`;
+5. running processes: a `(dev, ino)`-keyed index of bundle roots plus a snapshot of every
+   open file on the machine (950 processes, 6,586 resolved vnode paths, 18 ms), because
+   `NSWorkspace.runningApplications` listed neither Xcode nor Simulator while
+   `CoreSimulatorService` and `simdiskimaged` were both live;
+6. the volume — read-only, or the candidate is itself a mount point;
+7. the target's own scope, its exclusions, and its refuse-while-running list.
+
+Steps 2 and 3 are redundant on purpose: lexical matching can't see through a hardlink, and
+the identity walk can't cover a rule whose root doesn't exist on this machine. Either one
+denying is a denial, and there is no ordering of the checks and no argument a caller can
+pass that turns a refusal into permission.
+
+Refused outright: `/System`, `/usr` except `/usr/local`, `/Library/Apple`, both keychain
+directories, `~/Library/Group Containers`, `/bin`, `/sbin`, `/etc`, `/private/var` and
+everything under it, the TCC privacy database, and any path containing a `.git` component.
+Refused as items but not as subtrees — they are containers, not caches — the volume root,
+`/Users`, `/Volumes`, `/Applications`, `/Library`, `~`, `~/Library`, `~/Library/Containers`.
+Also refused: anything flagged `SF_DATALESS`, because trashing an iCloud placeholder
+removes the file from iCloud everywhere, and that is the worst single mistake this app
+could make.
+
+**The confirmation flow.** Nothing is ever pre-selected, and selection is cleared on every
+re-survey because what was on screen may no longer be what is on disk. Deleting always
+goes through a dry run, and the confirmation sheet lists the exact paths and per-item byte
+counts — not a summary or a count — alongside every path that was refused and the rule
+that refused it. Cancel is the default action and the destructive button deliberately is
+not, so Return never deletes anything. Targets at or above the "destroys local state"
+safety level require typing `move to trash` to enable the button.
+
+At execution time the plan is re-validated from scratch against a fresh process snapshot —
+a plan is a proposal about a filesystem that has moved on since — and the report says
+"Moved N items (X GB) to the Trash. No disk space has been freed yet", because until the
+Trash is emptied that is the truth.
+
+`LiveMachineTests` surveying the development Mac while Xcode, node and Docker were running:
+
+```
+xcode-derived-data:  present(11)  — 0 selectable, 11 refused
+npm-cache:           present(21)  — 0 selectable, 21 refused
+homebrew-cache:      present(134) — 134 selectable, 1.81 GB
+docker-desktop-disk-image: present(1) — 1 selectable, 1.77 GB
+stale-downloads:     present(289) — 0 selectable, 289 to review, 1.72 GB
+trash:               present(5)   — 0 selectable, 5 to review
+```
